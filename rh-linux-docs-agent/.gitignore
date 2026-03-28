@@ -1,0 +1,41 @@
+# Python virtual environment — never commit this (it's huge and machine-specific)
+venv/
+
+# Generated data — HTML cache and vector DB are too large for git
+data/
+
+# Secrets — API keys must never be committed
+.env
+
+# Python bytecode — auto-generated, not needed in git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Downloaded ML models (large files)
+models/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
