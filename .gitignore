@@ -1,0 +1,15 @@
+# raw docs
+dokumentacja/
+
+# local config
+.claude/
+rh-linux-docs-agent/.claude/
+
+# generated data
+rh-linux-docs-agent/data/
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
