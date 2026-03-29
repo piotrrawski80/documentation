@@ -44,8 +44,14 @@ def _format_answer(answer: Answer) -> str:
         "low": "\U0001f7e0", "insufficient": "\U0001f534",
     }.get(answer.confidence, "\u26aa")
 
+    # Version badge
+    ver_badge = f"RHEL {answer.resolved_version}"
+    if answer.version_source == "default":
+        ver_badge += " (default)"
+
     badges: list[str] = [
         f"**Confidence: {answer.confidence.title()}**",
+        f"Version: *{ver_badge}*",
         f"Type: *{answer.query_type}*",
     ]
     if answer.interface_intent != "neutral":
@@ -93,14 +99,15 @@ def chat(message: str, history: list[dict]) -> tuple[str, list[dict]]:
 
     try:
         engine = _get_engine()
-        answer = engine.ask(message, major_version="9")
+        answer = engine.ask(message)  # version auto-detected from query
         response = _format_answer(answer)
     except Exception as e:
         logger.error("QAEngine error: %s", e, exc_info=True)
         response = (
             f"**Error:** {e}\n\n"
             "If the database is empty, run:\n"
-            "```\npython scripts/ingest.py --version 9\n```"
+            "```\npython scripts/ingest.py --version 9\n```\n"
+            "For other versions: `--version 8` or `--version 10`"
         )
 
     history = history + [
@@ -116,8 +123,9 @@ def create_ui() -> gr.Blocks:
     with gr.Blocks() as demo:
 
         gr.Markdown(
-            "# RHEL 9 Documentation Agent\n"
-            "Ask questions about Red Hat Enterprise Linux 9. "
+            "# RHEL Documentation Agent\n"
+            "Ask questions about Red Hat Enterprise Linux (RHEL 8, 9, or 10). "
+            "Mention a version in your query or RHEL 9 is used by default. "
             "Answers are grounded strictly in retrieved documentation with citations."
         )
 
@@ -136,8 +144,8 @@ def create_ui() -> gr.Blocks:
         gr.Examples(
             examples=[
                 "How do I configure a static IP address on RHEL 9?",
-                "How do I troubleshoot SELinux permission denials?",
-                "How to enable FIPS crypto policy on RHEL 9?",
+                "How do I troubleshoot SELinux permission denials on RHEL 8?",
+                "What's new in RHEL 10 for container management?",
                 "Create and extend LVM logical volumes from the command line",
                 "How to configure firewalld to allow SSH and HTTPS?",
                 "How to run a rootless Podman container as a systemd service?",

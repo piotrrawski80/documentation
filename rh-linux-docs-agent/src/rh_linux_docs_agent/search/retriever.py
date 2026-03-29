@@ -359,10 +359,14 @@ class Retriever:
     Full retrieval pipeline: classify → hybrid search → rerank → threshold
     → interface bias → dedup → mismatch check.
 
+    Supports multi-version retrieval: each RHEL version has its own LanceDB
+    database.  HybridSearch instances are cached per version so the embedding
+    model and reranker are loaded only once.
+
     Args:
         use_reranker: If True (default), load and use cross-encoder reranker.
                       If False, skip reranking (faster, slightly lower quality).
-        store:        Optional DocStore to reuse.
+        store:        Optional DocStore to reuse (legacy single-DB mode).
         embedder:     Optional Embedder to reuse.
     """
 
@@ -372,9 +376,41 @@ class Retriever:
         store=None,
         embedder=None,
     ) -> None:
-        self.searcher = HybridSearch(store=store, embedder=embedder)
+        from rh_linux_docs_agent.indexer.embedder import Embedder as _Embedder
+        self._embedder = embedder or _Embedder()
         self.reranker = Reranker() if use_reranker else NoOpReranker()
         self._use_reranker = use_reranker
+
+        # Version-keyed cache of HybridSearch instances
+        self._searchers: dict[str, HybridSearch] = {}
+
+        # Legacy compatibility: if a store is provided, use it as default
+        if store:
+            self._default_searcher = HybridSearch(store=store, embedder=self._embedder)
+        else:
+            self._default_searcher = None
+
+    # Keep backward-compatible .searcher property (used in tests etc.)
+    @property
+    def searcher(self) -> HybridSearch:
+        """Return the default (RHEL 9) searcher for backward compatibility."""
+        return self._get_searcher("9")
+
+    def _get_searcher(self, version: str) -> HybridSearch:
+        """Get or create a HybridSearch for a specific RHEL version."""
+        if version in self._searchers:
+            return self._searchers[version]
+
+        if self._default_searcher and version == "9":
+            self._searchers[version] = self._default_searcher
+            return self._default_searcher
+
+        from rh_linux_docs_agent.indexer.store import DocStore
+        db_path = settings.db_path_for_version(version)
+        store = DocStore(db_path=db_path)
+        searcher = HybridSearch(store=store, embedder=self._embedder)
+        self._searchers[version] = searcher
+        return searcher
 
     def retrieve(
         self,
@@ -426,7 +462,9 @@ class Retriever:
 
         # ── Step 1: Retrieve candidates ─────────────────────────────────
         # Fetch extra candidates (k) to give reranker + dedup room.
-        candidates = self.searcher.search(
+        # Use version-specific searcher (separate LanceDB per version).
+        searcher = self._get_searcher(major_version or "9")
+        candidates = searcher.search(
             query,
             top_k=k,
             top_n=k,  # Get all k candidates for reranking

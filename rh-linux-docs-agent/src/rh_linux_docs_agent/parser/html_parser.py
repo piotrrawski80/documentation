@@ -58,27 +58,45 @@ ADMONITION_TYPES = {
 
 
 def parse_guide_html(
-    html_path: Path,
-    slug: str,
-    version: str,
+    html_path: Path | None = None,
+    slug: str = "",
+    version: str = "",
     source_url: str = "",
+    *,
+    html: str | None = None,
+    url: str | None = None,
+    guide_title: str | None = None,
 ) -> ParsedGuide:
     """
-    Parse a single RHEL guide from a local HTML file.
+    Parse a single RHEL guide from a local HTML file or raw HTML string.
 
     Args:
-        html_path: Path to the local index.html file.
+        html_path: Path to the local index.html file (mutually exclusive with html).
         slug: URL slug for the guide, e.g. "configuring_and_managing_networking".
         version: RHEL major version, e.g. "9".
         source_url: Optional URL override. If empty, reconstructed from slug+version.
+        html: Raw HTML string (alternative to html_path).
+        url: Alias for source_url (used by ingest pipeline).
+        guide_title: Optional title override (skips extraction from HTML).
 
     Returns:
         ParsedGuide with all extracted sections.
     """
-    html = html_path.read_text(encoding="utf-8")
-    soup = BeautifulSoup(html, "lxml")
+    # Resolve URL alias
+    if url and not source_url:
+        source_url = url
 
-    title = _extract_title(soup)
+    # Get HTML content from path or direct string
+    if html is not None:
+        html_content = html
+    elif html_path is not None:
+        html_content = html_path.read_text(encoding="utf-8")
+    else:
+        raise ValueError("Either html_path or html must be provided")
+
+    soup = BeautifulSoup(html_content, "lxml")
+
+    title = guide_title or _extract_title(soup)
 
     # Strip scripts, styles, nav
     _strip_noise(soup)
@@ -112,7 +130,7 @@ def parse_guide_html(
         major_version=major_version,
         minor_version=minor_version,
         doc_type=doc_type,
-        source_path=str(html_path),
+        source_path=str(html_path) if html_path else f"<html:{slug}>",
         guide_url=source_url,
         parser_version=PARSER_VERSION,
         last_parsed_at=now_iso(),

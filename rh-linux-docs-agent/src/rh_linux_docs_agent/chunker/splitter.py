@@ -48,6 +48,23 @@ MAX_TOKENS = 800     # Hard ceiling (except atomic code blocks)
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+
+def chunk_guide(parsed_guide) -> list[dict]:
+    """
+    Chunk all sections of a ParsedGuide into embedding-ready dicts.
+
+    Args:
+        parsed_guide: A ParsedGuide instance (from parser.models).
+
+    Returns:
+        List of chunk dicts ready for embedding + storage.
+    """
+    all_chunks: list[dict] = []
+    for record in parsed_guide.section_records():
+        all_chunks.extend(chunk_section_record(record))
+    return all_chunks
+
+
 def chunk_section_record(record: dict) -> list[dict]:
     """
     Split a single parsed section record into one or more chunk dicts.

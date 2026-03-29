@@ -31,8 +31,12 @@ class Settings(BaseSettings):
     )
 
     # ── Database ──────────────────────────────────────────────────────────────
-    # Where LanceDB stores its files. This is just a directory on disk.
-    db_path: Path = Path("data/lancedb")
+    # Parent directory for per-version LanceDB databases.
+    # Each version gets its own subdirectory: data/lancedb_v2/rhel9/, etc.
+    db_path: Path = Path("data/lancedb_v2")
+
+    # Legacy single-DB path (used as fallback if versioned path doesn't exist).
+    db_path_legacy: Path = Path("data/lancedb")
 
     # The name of the table inside LanceDB that holds all document chunks.
     table_name: str = "rhel_docs"
@@ -132,6 +136,34 @@ class Settings(BaseSettings):
 
     # Base URL for RHEL documentation.
     docs_base_url: str = "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux"
+
+
+    # ── Version-aware paths ──────────────────────────────────────────────────
+
+    def db_path_for_version(self, version: str) -> Path:
+        """
+        Return the LanceDB directory for a specific RHEL version.
+
+        Each version has its own directory: data/lancedb_v2/rhel9/, etc.
+        If the versioned directory doesn't exist yet, returns the path anyway
+        (it will be created on first ingest). No legacy fallback — each
+        version's data is strictly isolated.
+
+        Args:
+            version: RHEL major version string ("8", "9", or "10").
+
+        Returns:
+            Path to the LanceDB directory for this version.
+        """
+        return self.db_path / f"rhel{version}"
+
+    def parsed_dir_for_version(self, version: str) -> Path:
+        """Return parsed JSON directory for a version: data/parsed/rhel{v}/"""
+        return Path("data/parsed") / f"rhel{version}"
+
+    def chunked_dir_for_version(self, version: str) -> Path:
+        """Return chunked JSON directory for a version: data/chunked/rhel{v}/"""
+        return Path("data/chunked") / f"rhel{version}"
 
 
 # Global settings instance — import this in other modules.

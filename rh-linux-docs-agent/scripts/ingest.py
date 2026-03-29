@@ -128,11 +128,9 @@ def main(
     in a local vector database for fast retrieval.
     """
 
-    store = DocStore()
-
     # ── List mode ──────────────────────────────────────────────────────────
     if list_db:
-        _show_database_contents(store)
+        _show_all_versions()
         return
 
     # ── Delete mode ────────────────────────────────────────────────────────
@@ -143,27 +141,33 @@ def main(
                 f"Supported: {settings.supported_versions}"
             )
             raise typer.Exit(1)
-        console.print(f"[yellow]Deleting all RHEL {delete} chunks from database...[/yellow]")
-        n = store.delete_by_version(delete)
-        console.print(f"[green]✓[/green] Deleted chunks for RHEL {delete}")
-        _show_database_contents(store)
+        db_path = settings.db_path_for_version(delete)
+        store = DocStore(db_path=db_path)
+        console.print(f"[yellow]Deleting all RHEL {delete} chunks from {db_path}...[/yellow]")
+        store.drop_table()
+        console.print(f"[green]✓[/green] Deleted RHEL {delete} database")
+        _show_all_versions()
         return
 
     # ── Fresh mode ─────────────────────────────────────────────────────────
     if fresh:
         console.print(
             Panel(
-                "[bold red]WARNING: This will delete ALL data in the database.[/bold red]\n"
+                "[bold red]WARNING: This will delete ALL versioned databases.[/bold red]\n"
                 "All indexed documentation will be removed.",
                 title="Fresh Mode",
             )
         )
-        confirm = typer.confirm("Are you sure you want to drop the entire database?")
+        confirm = typer.confirm("Are you sure you want to drop all databases?")
         if not confirm:
             console.print("Aborted.")
             raise typer.Exit(0)
-        store.drop_table()
-        console.print("[green]✓[/green] Database cleared")
+        for v in settings.supported_versions:
+            db_path = settings.db_path_for_version(v)
+            if db_path.exists():
+                store = DocStore(db_path=db_path)
+                store.drop_table()
+                console.print(f"[green]✓[/green] Cleared RHEL {v} database")
 
     # ── Determine which versions to ingest ────────────────────────────────
     if all_versions:
@@ -200,6 +204,11 @@ def main(
         console.print(f"[bold cyan]  Ingesting RHEL {v}[/bold cyan]")
         console.print(f"[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
 
+        # Each version gets its own LanceDB database
+        db_path = settings.db_path_for_version(v)
+        console.print(f"  Database: {db_path}")
+        store = DocStore(db_path=db_path)
+
         total_chunks = _ingest_version(
             version=v,
             embedder=embedder,
@@ -210,22 +219,22 @@ def main(
         )
         grand_total_chunks += total_chunks
 
+        # Build indexes for this version's database
+        if build_index and total_chunks > 0:
+            console.print(f"\n[bold]Building search indexes for RHEL {v}...[/bold]")
+            store.create_indexes()
+            console.print(f"[green]✓[/green] RHEL {v} indexes built")
+
         elapsed = time.time() - start_time
         console.print(
             f"\n[green]✓[/green] RHEL {v} complete: "
             f"[bold]{total_chunks:,}[/bold] chunks in {elapsed:.0f}s"
         )
 
-    # ── Build search indexes ───────────────────────────────────────────────
-    if build_index and grand_total_chunks > 0:
-        console.print(f"\n[bold]Building search indexes...[/bold]")
-        store.create_indexes()
-        console.print("[green]✓[/green] Indexes built")
-
     # ── Final summary ─────────────────────────────────────────────────────
     console.print(f"\n[bold green]━━━ Ingestion Complete ━━━[/bold green]")
     console.print(f"  Total new chunks: [bold]{grand_total_chunks:,}[/bold]")
-    _show_database_contents(store)
+    _show_all_versions()
     console.print(
         "\n[dim]Start the agent with: python -m rh_linux_docs_agent.agent.app[/dim]"
     )
@@ -361,7 +370,7 @@ def _ingest_version(
 
     # ── Step 5: Embed chunks ───────────────────────────────────────────────
     console.print(f"\n[Step 5/6] Embedding chunks...")
-    texts = [chunk.text for chunk in all_chunks]
+    texts = [chunk["chunk_text"] for chunk in all_chunks]
     vectors = embedder.embed_with_progress(texts, description=f"Embedding RHEL {version}")
 
     console.print(f"  Embedded [bold]{len(vectors):,}[/bold] chunks")
@@ -379,27 +388,39 @@ def _ingest_version(
     return n_inserted
 
 
-def _show_database_contents(store: DocStore) -> None:
-    """Display a table showing what's currently in the database."""
+def _show_all_versions() -> None:
+    """Display a table showing what's currently indexed across all versioned databases."""
     console.print("\n[bold]Database Contents:[/bold]")
-
-    versions = store.list_versions()
-
-    if not versions:
-        console.print("  [dim]Database is empty. Run ingestion to populate it.[/dim]")
-        return
 
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Version", style="cyan", width=12)
+    table.add_column("Database Path", style="dim")
     table.add_column("Chunks", justify="right")
 
     total = 0
-    for v, count in sorted(versions.items()):
-        table.add_row(f"RHEL {v}", f"{count:,}")
-        total += count
+    found_any = False
 
-    table.add_row("[bold]Total[/bold]", f"[bold]{total:,}[/bold]")
+    for v in sorted(settings.supported_versions):
+        db_path = settings.db_path_for_version(v)
+        if not db_path.exists():
+            table.add_row(f"RHEL {v}", str(db_path), "[dim]not indexed[/dim]")
+            continue
+
+        try:
+            store = DocStore(db_path=db_path)
+            count = store.get_total_count()
+            table.add_row(f"RHEL {v}", str(db_path), f"{count:,}")
+            total += count
+            found_any = True
+        except Exception as e:
+            table.add_row(f"RHEL {v}", str(db_path), f"[red]error: {e}[/red]")
+
+    if found_any:
+        table.add_row("[bold]Total[/bold]", "", f"[bold]{total:,}[/bold]")
     console.print(table)
+
+    if not found_any:
+        console.print("  [dim]No databases found. Run ingestion to populate them.[/dim]")
 
 
 if __name__ == "__main__":

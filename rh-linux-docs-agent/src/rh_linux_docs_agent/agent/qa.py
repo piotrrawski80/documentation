@@ -29,6 +29,7 @@ import httpx
 from rh_linux_docs_agent.search.retriever import (
     Retriever, classify_query, detect_interface_intent,
 )
+from rh_linux_docs_agent.agent.version_resolver import resolve_version
 from rh_linux_docs_agent.config import settings
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ class Answer:
     query_type: str = "procedure"       # procedure / concept / troubleshooting / reference
     interface_intent: str = "neutral"   # cli / gui / neutral
     interface_mismatch: str = ""        # non-empty when results don't match intent
+    resolved_version: str = "9"        # which RHEL version corpus was used
+    version_source: str = "default"    # "explicit" or "default"
     retrieval_time_s: float = 0.0
     generation_time_s: float = 0.0
     model: str = ""
@@ -106,8 +109,9 @@ You answer questions ONLY from the retrieved documentation chunks provided below
 6. **Verbatim reproduction.** Reproduce commands/code exactly in fenced blocks.
    Do not modify, extend, or add flags not in the source.
 
-7. **Version awareness.** Context is from RHEL 9. If the user asks about
-   another version, note this.
+7. **Version awareness.** Context is version-specific. The retrieved
+   documentation header states which RHEL version it covers. If the user
+   asks about a different version, note this.
 
 8. **Format.** Markdown. Code in fenced blocks. Be concise.
 """
@@ -363,10 +367,12 @@ def _log_query(answer: "Answer") -> None:
         for s in answer.sources[:3]
     ]
     logger.info(
-        "QA query processed | query=%r | query_type=%s | intent=%s | "
+        "QA query processed | query=%r | version=%s (%s) | query_type=%s | intent=%s | "
         "confidence=%s | answer_mode=%s | mismatch=%s | chunks=%d | "
         "retrieval=%.3fs | generation=%.3fs | model=%s | top_sources=%s",
         answer.query[:120],
+        answer.resolved_version,
+        answer.version_source,
         answer.query_type,
         answer.interface_intent,
         answer.confidence,
@@ -402,7 +408,7 @@ class QAEngine:
         self,
         query: str,
         *,
-        major_version: str = "9",
+        major_version: str | None = None,
         top_k: int = 20,
         top_n: int | None = None,
         doc_type: str | None = None,
@@ -410,14 +416,21 @@ class QAEngine:
     ) -> Answer:
         n = top_n or settings.search_rerank_top_n
 
-        # Step 0: Classify
+        # Step 0a: Resolve version from query (or use explicit override)
+        if major_version:
+            resolved_version = major_version
+            version_source = "explicit"
+        else:
+            resolved_version, version_source = resolve_version(query)
+
+        # Step 0b: Classify
         query_type = classify_query(query)
         interface_intent = detect_interface_intent(query)
 
-        # Step 1: Retrieve
+        # Step 1: Retrieve (version-specific index)
         t0 = time.time()
         results = self.retriever.retrieve(
-            query, major_version=major_version, top_k=top_k, top_n=n,
+            query, major_version=resolved_version, top_k=top_k, top_n=n,
             doc_type=doc_type, guide_slug=guide_slug,
         )
         retrieval_time = time.time() - t0
@@ -458,7 +471,7 @@ class QAEngine:
 
         user_message = (
             f"## Question\n{query}\n\n"
-            f"## Retrieved Documentation (RHEL {major_version})\n\n{context}\n\n"
+            f"## Retrieved Documentation (RHEL {resolved_version})\n\n{context}\n\n"
             f"## Instructions\n"
             f"Answer using ONLY the chunks above. Cite as [Source N].\n"
             f"Do NOT introduce any commands or paths not in the chunks.\n"
@@ -476,6 +489,7 @@ class QAEngine:
             answer_text = _build_offline_answer(
                 query, results, sources, confidence, answer_mode,
                 interface_mismatch, facet_coverage,
+                version=resolved_version,
             )
             model_used = "offline (no API key)"
         except Exception as e:
@@ -483,6 +497,7 @@ class QAEngine:
             answer_text = _build_offline_answer(
                 query, results, sources, confidence, answer_mode,
                 interface_mismatch, facet_coverage,
+                version=resolved_version,
             )
             model_used = f"offline (LLM error: {e})"
         generation_time = time.time() - t1
@@ -496,6 +511,8 @@ class QAEngine:
             query_type=query_type,
             interface_intent=interface_intent,
             interface_mismatch=interface_mismatch,
+            resolved_version=resolved_version,
+            version_source=version_source,
             retrieval_time_s=round(retrieval_time, 3),
             generation_time_s=round(generation_time, 3),
             model=model_used,
@@ -510,13 +527,14 @@ class QAEngine:
         self,
         query: str,
         *,
-        major_version: str = "9",
+        major_version: str | None = None,
         top_k: int = 20,
         top_n: int | None = None,
     ) -> tuple[list[dict], str, list[Source]]:
         n = top_n or settings.search_rerank_top_n
+        version = major_version or resolve_version(query)[0]
         results = self.retriever.retrieve(
-            query, major_version=major_version, top_k=top_k, top_n=n,
+            query, major_version=version, top_k=top_k, top_n=n,
         )
         context, sources = assemble_context(results)
         return results, context, sources
@@ -532,6 +550,7 @@ def _build_offline_answer(
     answer_mode: str,
     interface_mismatch: str = "",
     facet_coverage: dict[str, list[int]] | None = None,
+    version: str = "9",
 ) -> str:
     """
     Synthesize a concise, structured answer from retrieved chunks.
@@ -546,7 +565,7 @@ def _build_offline_answer(
     if not results:
         return (
             "**Confidence: Insufficient**\n\n"
-            f"No relevant RHEL 9 documentation found for this query.\n"
+            f"No relevant RHEL {version} documentation found for this query.\n"
             f"Please consult https://docs.redhat.com"
         )
 

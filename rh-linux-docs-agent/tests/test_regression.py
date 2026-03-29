@@ -29,6 +29,7 @@ from rh_linux_docs_agent.agent.qa import (
     QAEngine, Answer, _extract_facets, _assess_confidence,
 )
 from rh_linux_docs_agent.search.retriever import classify_query, detect_interface_intent
+from rh_linux_docs_agent.agent.version_resolver import resolve_version
 
 
 # ── Shared engine fixture (loaded once per session) ──────────────────────────
@@ -39,8 +40,11 @@ def engine():
     return QAEngine(use_reranker=True)
 
 
-def _ask(engine: QAEngine, query: str) -> Answer:
-    return engine.ask(query, major_version="9")
+def _ask(engine: QAEngine, query: str, major_version: str | None = None) -> Answer:
+    """Ask a query. If major_version is None, version is auto-detected from query."""
+    if major_version:
+        return engine.ask(query, major_version=major_version)
+    return engine.ask(query)
 
 
 # ── Query classification tests ───────────────────────────────────────────────
@@ -270,3 +274,115 @@ class TestNoPydanticAI:
         import rh_linux_docs_agent.agent.app as app_mod
         source = Path(app_mod.__file__).read_text()
         assert "pydantic_ai" not in source
+
+
+# ── Version resolver tests ──────────────────────────────────────────────────
+
+class TestVersionResolver:
+    """Test version detection from query text."""
+
+    def test_explicit_rhel9(self):
+        v, src = resolve_version("How to configure firewalld on RHEL 9?")
+        assert v == "9"
+        assert src == "explicit"
+
+    def test_explicit_rhel8(self):
+        v, src = resolve_version("How to configure firewalld on RHEL 8?")
+        assert v == "8"
+        assert src == "explicit"
+
+    def test_explicit_rhel10(self):
+        v, src = resolve_version("What's new in RHEL 10 for containers?")
+        assert v == "10"
+        assert src == "explicit"
+
+    def test_explicit_no_space(self):
+        v, src = resolve_version("Configure firewalld on RHEL9")
+        assert v == "9"
+        assert src == "explicit"
+
+    def test_explicit_full_name(self):
+        v, src = resolve_version(
+            "How to enable FIPS on Red Hat Enterprise Linux 8?"
+        )
+        assert v == "8"
+        assert src == "explicit"
+
+    def test_explicit_el_shorthand(self):
+        v, src = resolve_version("Install package on EL9")
+        assert v == "9"
+        assert src == "explicit"
+
+    def test_default_no_version(self):
+        v, src = resolve_version("How to configure firewalld?")
+        assert v == "9"
+        assert src == "default"
+
+    def test_default_ambiguous(self):
+        v, src = resolve_version("Best practices for LVM management")
+        assert v == "9"
+        assert src == "default"
+
+    def test_explicit_with_minor_version(self):
+        v, src = resolve_version("Changes in RHEL 9.4")
+        assert v == "9"
+        assert src == "explicit"
+
+    def test_unsupported_version_defaults(self):
+        v, src = resolve_version("Configure networking on RHEL 7")
+        # 7 is not in supported_versions → default
+        assert v == "9"
+        assert src == "default"
+
+
+# ── Multi-version QA tests ──────────────────────────────────────────────────
+
+class TestMultiVersionQA:
+    """Test that version resolver integrates with QAEngine correctly."""
+
+    def test_rhel9_explicit_returns_results(self, engine):
+        """RHEL 9 explicit query should return results (we have RHEL 9 data)."""
+        a = _ask(engine, "How to configure firewalld on RHEL 9?")
+        assert a.resolved_version == "9"
+        assert a.version_source == "explicit"
+        assert a.context_chunks > 0
+
+    def test_rhel9_default_returns_results(self, engine):
+        """No version mentioned → defaults to RHEL 9 → should return results."""
+        a = _ask(engine, "How to configure firewalld?")
+        assert a.resolved_version == "9"
+        assert a.version_source == "default"
+        assert a.context_chunks > 0
+
+    def test_rhel8_explicit_no_data(self, engine):
+        """RHEL 8 query but no RHEL 8 data indexed → insufficient or 0 chunks."""
+        a = _ask(engine, "How to configure firewalld on RHEL 8?")
+        assert a.resolved_version == "8"
+        assert a.version_source == "explicit"
+        # No RHEL 8 data indexed → should be insufficient
+        # (unless legacy DB has RHEL 8 data)
+        if a.context_chunks == 0:
+            assert a.confidence == "insufficient"
+
+    def test_rhel10_explicit_no_data(self, engine):
+        """RHEL 10 query but no RHEL 10 data indexed → insufficient or 0 chunks."""
+        a = _ask(engine, "What's new in RHEL 10 for containers?")
+        assert a.resolved_version == "10"
+        assert a.version_source == "explicit"
+        if a.context_chunks == 0:
+            assert a.confidence == "insufficient"
+
+    def test_version_in_answer_metadata(self, engine):
+        """Answer must carry resolved_version and version_source."""
+        a = _ask(engine, "How to install packages with dnf on RHEL 9?")
+        assert hasattr(a, "resolved_version")
+        assert hasattr(a, "version_source")
+        assert a.resolved_version in ("8", "9", "10")
+        assert a.version_source in ("explicit", "default")
+
+    def test_version_override(self, engine):
+        """Explicit major_version parameter overrides auto-detection."""
+        # Query says "RHEL 10" but we force version 9
+        a = _ask(engine, "What's new in RHEL 10?", major_version="9")
+        assert a.resolved_version == "9"
+        assert a.context_chunks > 0  # Should find RHEL 9 data

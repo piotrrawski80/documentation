@@ -280,6 +280,13 @@ class DocStore:
             return 0
         return self.create_or_open_table().count_rows()
 
+    def list_versions(self) -> dict[str, int]:
+        """Return a dict of {version: chunk_count} for all versions in this DB."""
+        if settings.table_name not in self.db.table_names():
+            return {}
+        stats = self.table_stats()
+        return stats.get("versions", {})
+
     def drop_table(self) -> None:
         """Drop the entire table. Use with caution."""
         if settings.table_name in self.db.table_names():
