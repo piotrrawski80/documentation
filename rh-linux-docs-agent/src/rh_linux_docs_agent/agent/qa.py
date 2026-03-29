@@ -1,35 +1,34 @@
 """
-agent/qa.py — QA answer engine: retrieval + context assembly + LLM generation.
-
-Takes a user question, retrieves relevant RHEL documentation chunks via the
-Retriever pipeline, assembles them into a prompt, and sends to an LLM for
-grounded answer generation with citations.
+agent/qa.py — QA answer engine: retrieval + context assembly + answer synthesis.
 
 Pipeline:
-  user query → Retriever(classify+hybrid+rerank+dedup) → context assembly → LLM → Answer
+  user query -> Retriever(classify+hybrid+rerank+dedup) -> coverage assessment
+             -> context assembly -> answer synthesis (offline or LLM) -> Answer
+
+Two execution modes:
+  - offline:  Extracts commands/steps directly from retrieved chunks.
+              Produces a concise, structured answer with no external API.
+  - online:   Sends context to an LLM (via OpenRouter) for grounded synthesis.
+              Still strictly grounded — the LLM may only cite retrieved evidence.
 
 Key principles:
   - Answers ONLY from retrieved context (no hallucination)
-  - Every claim must cite section_url + heading
+  - Every claim cites [Source N] with full URL
   - Explicit uncertainty when evidence is insufficient
-  - Version-aware (RHEL 9 focus)
-
-Usage:
-    engine = QAEngine()
-    answer = engine.ask("How to configure a static IP on RHEL 9?")
-    print(answer.text)
-    for src in answer.sources:
-        print(f"  - {src.heading}: {src.section_url}")
+  - Multi-part queries get per-facet coverage check
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
-from rh_linux_docs_agent.search.retriever import Retriever, classify_query
+from rh_linux_docs_agent.search.retriever import (
+    Retriever, classify_query, detect_interface_intent,
+)
 from rh_linux_docs_agent.config import settings
 
 logger = logging.getLogger(__name__)
@@ -50,7 +49,6 @@ class Source:
 
     @property
     def citation_label(self) -> str:
-        """Consistent 'Guide Title — Heading' label used in all citation lists."""
         return f"{self.guide_title} — {self.heading}"
 
 
@@ -60,16 +58,19 @@ class Answer:
     query: str
     text: str
     sources: list[Source] = field(default_factory=list)
-    confidence: str = "high"           # "high", "medium", "low", "insufficient"
-    query_type: str = "procedure"      # "procedure", "concept", "troubleshooting", "reference"
+    confidence: str = "medium"          # high / medium / low / insufficient
+    answer_mode: str = "exact"          # exact / partial / insufficient
+    query_type: str = "procedure"       # procedure / concept / troubleshooting / reference
+    interface_intent: str = "neutral"   # cli / gui / neutral
+    interface_mismatch: str = ""        # non-empty when results don't match intent
     retrieval_time_s: float = 0.0
     generation_time_s: float = 0.0
     model: str = ""
     context_chunks: int = 0
-    raw_context: str = ""              # The full context sent to LLM (for debugging)
+    raw_context: str = ""
 
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt (LLM online mode) ──────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
 You are a Red Hat Enterprise Linux (RHEL) documentation assistant.
@@ -77,203 +78,262 @@ You answer questions ONLY from the retrieved documentation chunks provided below
 
 ## Strict grounding rules
 
-1. **Evidence-only answers.** Every statement you make must come from the
-   retrieved chunks. Do NOT introduce commands, file paths, CLI options,
-   configuration directives, package names, or procedures that do not appear
-   verbatim in the provided context — even if you know them to be correct.
+1. **Evidence-only answers.** Every statement must come from the retrieved
+   chunks. Do NOT introduce commands, file paths, CLI options, configuration
+   directives, package names, or procedures not present verbatim in the
+   provided context — even if you know them to be correct.
 
-2. **No gap-filling.** If the retrieved context discusses a topic but does not
-   include the specific command, flag, or step the user is asking about, you
-   must say so explicitly. Use phrasing such as:
-   - "The retrieved documentation covers [topic X], but the specific
-     command/procedure for [Y] is not shown in the retrieved evidence."
-   - "The retrieved chunks describe [general concept]; for the exact CLI
-     syntax, consult the full guide linked below."
-   Never fill the gap with commands from your own training data.
+2. **No gap-filling.** If the context discusses a topic but lacks the specific
+   command or step the user asks about, say so explicitly. Never fill the gap
+   with commands from your own training data.
 
-3. **Mandatory citations.** After every factual claim, append [Source N]
-   where N is the chunk number. At the end of your answer, list every cited
-   source in this exact format:
-
+3. **Mandatory citations.** After every factual claim, append [Source N].
+   At the end list every cited source:
    **Sources:**
    1. *Guide Title — Section Heading*
       URL
 
-   Always include both the guide title and full URL for every source.
-
 4. **Confidence header.** Begin with exactly one of:
-   - **Confidence: High** — the context directly and fully answers the question
-   - **Confidence: Medium** — the context is relevant but incomplete or
-     requires interpretation; say what IS covered and what is NOT
-   - **Confidence: Low** — the context is only tangentially related
-   - **Confidence: Insufficient** — the context does not contain enough
-     information to answer
+   - **Confidence: High** — context directly and fully answers the question
+   - **Confidence: Medium** — context is relevant but incomplete
+   - **Confidence: Low** — context is only tangentially related
+   - **Confidence: Insufficient** — not enough information to answer
 
-5. **When confidence is Medium, Low, or Insufficient**, always include:
-   "For the complete procedure, consult the full section at [URL] or the
-   official Red Hat documentation at https://docs.redhat.com"
+5. **When confidence < High**, include:
+   "For the complete procedure, consult the full section at [URL] or
+   https://docs.redhat.com"
 
-6. **Verbatim reproduction.** When the context contains a command, config
-   snippet, or code block, reproduce it exactly in a fenced code block.
-   Do not modify, extend, or add flags/options that are not in the source.
+6. **Verbatim reproduction.** Reproduce commands/code exactly in fenced blocks.
+   Do not modify, extend, or add flags not in the source.
 
-7. **Complementary & conflicting sources.** If multiple chunks from different
-   guides address the same question, note this. If they appear to conflict,
-   flag the discrepancy and cite both.
+7. **Version awareness.** Context is from RHEL 9. If the user asks about
+   another version, note this.
 
-8. **Version awareness.** The context comes from RHEL 9. If the user asks
-   about RHEL 8 or 10, state that the retrieved evidence is RHEL 9-specific.
-
-9. **Format.** Markdown. Code in fenced blocks. Be concise — focus on what
-   the evidence supports, not on general background.
+8. **Format.** Markdown. Code in fenced blocks. Be concise.
 """
+
+
+# ── Query facet extraction ───────────────────────────────────────────────────
+
+_FACET_PATTERNS: list[tuple[str, re.Pattern, list[str]]] = [
+    ("create", re.compile(r"\b(create|creating|make|making|add|new)\b", re.I),
+     ["lvcreate", "creating", "create a", "create the"]),
+    ("extend", re.compile(r"\b(extend|expanding|expand|enlarge|grow|resize|increase)\b", re.I),
+     ["lvextend", "extending", "extend", "resize"]),
+    ("shrink", re.compile(r"\b(shrink|reducing|reduce|decrease)\b", re.I),
+     ["lvreduce", "shrink", "reducing"]),
+    ("remove", re.compile(r"\b(remove|removing|delete|deleting)\b", re.I),
+     ["lvremove", "removing", "remove"]),
+    ("snapshot", re.compile(r"\bsnapshot\b", re.I), ["snapshot"]),
+    ("configure", re.compile(r"\b(configure|configuring|set\s*up|setup)\b", re.I),
+     ["configur", "set up"]),
+    ("enable", re.compile(r"\b(enable|enabling)\b", re.I), ["enable", "enabling"]),
+    ("disable", re.compile(r"\b(disable|disabling)\b", re.I), ["disable", "disabling"]),
+    ("troubleshoot", re.compile(r"\b(troubleshoot|troubleshooting|debug|diagnose|fix)\b", re.I),
+     ["troubleshoot", "debug", "diagnos"]),
+    ("install", re.compile(r"\b(install|installing)\b", re.I), ["install"]),
+    ("start", re.compile(r"\b(start|starting|restart|restarting)\b", re.I), ["start", "restart"]),
+    ("stop", re.compile(r"\b(stop|stopping)\b", re.I), ["stop"]),
+    ("list", re.compile(r"\b(list|show|display)\b", re.I), ["list", "show", "display"]),
+]
+
+
+def _extract_facets(query: str) -> list[str]:
+    """Extract 2+ distinct operational facets from a query, or [] for single-op."""
+    matched = []
+    for label, pattern, _kw in _FACET_PATTERNS:
+        if pattern.search(query):
+            matched.append(label)
+    return matched if len(matched) >= 2 else []
+
+
+def _check_facet_coverage(
+    facets: list[str],
+    results: list[dict],
+    sources: list[Source],
+) -> dict[str, list[int]]:
+    """Map each facet to 1-based source indices that cover it."""
+    coverage: dict[str, list[int]] = {f: [] for f in facets}
+    for facet in facets:
+        keywords = []
+        for label, _pat, kw in _FACET_PATTERNS:
+            if label == facet:
+                keywords = kw
+                break
+        for i, (r, s) in enumerate(zip(results, sources), start=1):
+            combined = f"{s.heading}\n{r.get('chunk_text', '')}".lower()
+            if any(kw.lower() in combined for kw in keywords):
+                coverage[facet].append(i)
+    return coverage
+
+
+# ── Confidence assessment ────────────────────────────────────────────────────
+
+def _assess_confidence(
+    results: list[dict],
+    query: str,
+    interface_mismatch: str,
+    facet_coverage: dict[str, list[int]] | None,
+) -> tuple[str, str]:
+    """
+    Returns (confidence, answer_mode).
+    confidence: high / medium / low / insufficient
+    answer_mode: exact / partial / insufficient
+    """
+    if not results:
+        return "insufficient", "insufficient"
+
+    scores = [r.get("_rerank_score", r.get("_score", 0)) for r in results]
+    top_score = scores[0]
+    avg_score = sum(scores) / len(scores)
+    is_cross_encoder = abs(top_score) > 1.5
+
+    if is_cross_encoder:
+        score_quality = (
+            "strong" if top_score > 7 and avg_score > 5
+            else "good" if top_score > 5 and avg_score > 4
+            else "moderate" if top_score > 3
+            else "weak"
+        )
+    else:
+        score_quality = (
+            "strong" if top_score > 0.5
+            else "good" if top_score > 0.3
+            else "moderate" if top_score > 0.1
+            else "weak"
+        )
+
+    has_mismatch = bool(interface_mismatch)
+
+    if facet_coverage:
+        covered_facets = sum(1 for srcs in facet_coverage.values() if srcs)
+        total_facets = len(facet_coverage)
+        all_covered = covered_facets == total_facets
+        most_covered = covered_facets >= total_facets * 0.5
+    else:
+        all_covered = True
+        most_covered = True
+
+    if len(results) >= 3:
+        primary_guide = results[0].get("guide_slug", "")
+        on_topic = sum(
+            1 for r in results
+            if r.get("guide_slug") == primary_guide
+            or r.get("content_type") == "procedure"
+        )
+        noise_ratio = 1.0 - (on_topic / len(results))
+    else:
+        noise_ratio = 0.0
+
+    if has_mismatch:
+        return "low", "partial"
+    if score_quality == "weak":
+        return "insufficient", "insufficient"
+    if all_covered and score_quality in ("strong", "good") and noise_ratio < 0.4:
+        return "high", "exact"
+    if all_covered and score_quality == "moderate":
+        return "medium", "exact"
+    if all_covered and noise_ratio >= 0.4:
+        return "medium", "exact"
+    if most_covered:
+        return "medium", "partial"
+    return "low", "partial"
 
 
 # ── Context assembly ──────────────────────────────────────────────────────────
 
-def assemble_context(results: list[dict], max_chars: int = 12000) -> tuple[str, list[Source]]:
-    """
-    Build the context string and source list from retrieval results.
-
-    Each chunk is numbered [Source 1], [Source 2], ... for citation.
-    Chunk headers include guide title, heading, content type, and full URL
-    so the LLM can produce consistent citations.
-
-    Truncates total context to max_chars to stay within LLM limits.
-
-    Returns:
-        (context_string, list_of_Source_objects)
-    """
+def assemble_context(
+    results: list[dict], max_chars: int = 12_000,
+) -> tuple[str, list[Source]]:
+    """Build numbered [Source N] context string and Source list."""
     sources: list[Source] = []
     parts: list[str] = []
-    total_chars = 0
+    total = 0
 
-    for i, r in enumerate(results, start=1):
+    for i, r in enumerate(results, 1):
         text = r.get("chunk_text", "")
-        heading = r.get("heading", "Unknown")
-        guide_title = r.get("guide_title", "Unknown")
-        section_url = r.get("section_url", "")
-        guide_slug = r.get("guide_slug", "")
-        content_type = r.get("content_type", "")
-        rerank_score = r.get("_rerank_score", r.get("_score", 0.0))
-
-        # Truncate individual chunks if needed
         if len(text) > 3000:
             text = text[:3000] + "\n... [truncated]"
 
-        # Consistent header with full citation metadata
-        chunk_header = (
+        block = (
             f"[Source {i}]\n"
-            f"  Guide:   {guide_title}\n"
-            f"  Section: {heading}\n"
-            f"  Type:    {content_type}\n"
-            f"  URL:     {section_url}\n"
+            f"  Guide:   {r.get('guide_title', 'Unknown')}\n"
+            f"  Section: {r.get('heading', 'Unknown')}\n"
+            f"  Type:    {r.get('content_type', '')}\n"
+            f"  URL:     {r.get('section_url', '')}\n"
+            f"\n{text}\n"
         )
-        chunk_block = f"{chunk_header}\n{text}\n"
-
-        if total_chars + len(chunk_block) > max_chars:
+        if total + len(block) > max_chars:
             break
-
-        parts.append(chunk_block)
-        total_chars += len(chunk_block)
+        parts.append(block)
+        total += len(block)
 
         sources.append(Source(
-            guide_title=guide_title,
-            heading=heading,
-            section_url=section_url,
-            guide_slug=guide_slug,
-            content_type=content_type,
+            guide_title=r.get("guide_title", "Unknown"),
+            heading=r.get("heading", "Unknown"),
+            section_url=r.get("section_url", ""),
+            guide_slug=r.get("guide_slug", ""),
+            content_type=r.get("content_type", ""),
             chunk_text=text[:500],
-            rerank_score=float(rerank_score),
+            rerank_score=float(r.get("_rerank_score", r.get("_score", 0.0))),
         ))
 
-    context = "\n---\n".join(parts)
-    return context, sources
+    return "\n---\n".join(parts), sources
 
-
-def _assess_confidence(results: list[dict], query: str) -> str:
-    """
-    Pre-assess confidence based on retrieval scores before LLM generation.
-
-    Uses both the reranker score and the spread between top results.
-    Returns "high", "medium", "low", or "insufficient".
-    """
-    if not results:
-        return "insufficient"
-
-    top_score = results[0].get("_rerank_score", results[0].get("_score", 0))
-
-    # Detect score type: cross-encoder scores are typically in range [-10, 12],
-    # while RRF/vector scores are in [0, 1]. Cross-encoder always > 1 for good matches.
-    is_cross_encoder = abs(top_score) > 1.5
-
-    if is_cross_encoder:
-        # Cross-encoder scores: >7 strong, 4-7 moderate, <4 weak
-        if top_score > 7:
-            return "high"
-        elif top_score > 4:
-            if len(results) >= 3:
-                avg_top3 = sum(r.get("_rerank_score", r.get("_score", 0)) for r in results[:3]) / 3
-                if avg_top3 > 5:
-                    return "high"
-            return "medium"
-        elif top_score > 2:
-            return "low"
-        else:
-            return "insufficient"
-    else:
-        # RRF or vector similarity score (0 to 1 range)
-        if top_score > 0.5:
-            return "high"
-        elif top_score > 0.3:
-            return "medium"
-        elif top_score > 0.005:
-            return "low"
-        else:
-            return "insufficient"
-
-
-# ── Citation formatting ──────────────────────────────────────────────────────
 
 def _format_source_list(sources: list[Source]) -> str:
-    """
-    Render the numbered source list used at the bottom of both LLM and
-    offline answers.  Each entry shows guide title, heading, and full URL.
-
-    Format:
-        **Sources:**
-        1. *Guide Title — Heading*
-           https://docs.redhat.com/...
-    """
-    lines = ["**Sources:**\n"]
-    for i, s in enumerate(sources, start=1):
+    lines = ["**Sources:**"]
+    for i, s in enumerate(sources, 1):
         lines.append(f"{i}. *{s.citation_label}*")
         lines.append(f"   {s.section_url}")
     return "\n".join(lines)
 
 
+# ── Chunk text helpers ────────────────────────────────────────────────────────
+
+_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_NUMBERED_STEP_RE = re.compile(r"^(\d+)\.\s+(.+)", re.MULTILINE)
+
+
+def _extract_commands(text: str) -> list[str]:
+    """Pull fenced code blocks from a chunk."""
+    return [m.group(1).strip() for m in _CODE_BLOCK_RE.finditer(text)]
+
+
+def _extract_steps(text: str) -> list[str]:
+    """Pull numbered procedure steps from a chunk (first line of each)."""
+    return [m.group(0).strip() for m in _NUMBERED_STEP_RE.finditer(text)]
+
+
+def _first_sentence(text: str, max_len: int = 200) -> str:
+    """Return the first meaningful sentence from chunk text, skipping the heading."""
+    lines = text.strip().split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("```"):
+            continue
+        # Skip lines that look like headings (all-digit prefix like "4.2.1.")
+        if re.match(r"^\d+(\.\d+)*\.\s", line):
+            continue
+        # Skip prerequisite bullet lines
+        if line.startswith("- ") and len(line) < 60:
+            continue
+        sent = line[:max_len]
+        if len(line) > max_len:
+            sent = sent.rsplit(" ", 1)[0] + "..."
+        return sent
+    return ""
+
+
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
 def _call_llm(system: str, user_message: str) -> str:
-    """
-    Call the LLM via OpenRouter (OpenAI-compatible API).
-
-    Uses httpx for a simple synchronous POST — no pydantic-ai dependency.
-
-    Returns:
-        The LLM's response text.
-
-    Raises:
-        RuntimeError: If the API call fails or no key is configured.
-    """
+    """Call the LLM via OpenRouter. Raises RuntimeError if no API key."""
     api_key = settings.openrouter_api_key
     if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY not set. "
-            "Create a .env file with: OPENROUTER_API_KEY=your-key-here"
-        )
+        raise RuntimeError("OPENROUTER_API_KEY not set")
 
-    response = httpx.post(
+    resp = httpx.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -290,21 +350,45 @@ def _call_llm(system: str, user_message: str) -> str:
         },
         timeout=60.0,
     )
-    response.raise_for_status()
-    data = response.json()
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
-    return data["choices"][0]["message"]["content"]
+
+# ── Structured logging ────────────────────────────────────────────────────────
+
+def _log_query(answer: "Answer") -> None:
+    """Emit a single structured log line with all query metadata."""
+    top_sources = [
+        {"title": s.heading[:60], "url": s.section_url, "score": round(s.rerank_score, 2)}
+        for s in answer.sources[:3]
+    ]
+    logger.info(
+        "QA query processed | query=%r | query_type=%s | intent=%s | "
+        "confidence=%s | answer_mode=%s | mismatch=%s | chunks=%d | "
+        "retrieval=%.3fs | generation=%.3fs | model=%s | top_sources=%s",
+        answer.query[:120],
+        answer.query_type,
+        answer.interface_intent,
+        answer.confidence,
+        answer.answer_mode,
+        bool(answer.interface_mismatch),
+        answer.context_chunks,
+        answer.retrieval_time_s,
+        answer.generation_time_s,
+        answer.model,
+        top_sources,
+    )
 
 
 # ── QA Engine ─────────────────────────────────────────────────────────────────
 
 class QAEngine:
     """
-    Full QA pipeline: retrieve → assemble context → generate answer.
+    Full QA pipeline: retrieve -> assess coverage -> synthesize answer.
 
-    Args:
-        use_reranker: Whether to use cross-encoder reranking (default True).
-        retriever:    Optional pre-built Retriever to reuse.
+    Works in two modes:
+      - offline (no API key): synthesizes answer directly from chunk content
+      - online (API key set): sends context to LLM for grounded generation
     """
 
     def __init__(
@@ -324,90 +408,103 @@ class QAEngine:
         doc_type: str | None = None,
         guide_slug: str | None = None,
     ) -> Answer:
-        """
-        Answer a question using retrieved RHEL documentation.
-
-        Args:
-            query:          The user's question.
-            major_version:  RHEL version to search (default "9").
-            top_k:          Retrieval candidates.
-            top_n:          Final chunks for context (default from settings).
-            doc_type:       Optional doc_type filter.
-            guide_slug:     Optional guide filter.
-
-        Returns:
-            Answer object with text, sources, confidence, and timing.
-        """
         n = top_n or settings.search_rerank_top_n
 
-        # Step 0: Classify query
+        # Step 0: Classify
         query_type = classify_query(query)
+        interface_intent = detect_interface_intent(query)
 
-        # Step 1: Retrieve (includes rerank + threshold + dedup)
+        # Step 1: Retrieve
         t0 = time.time()
         results = self.retriever.retrieve(
-            query,
-            major_version=major_version,
-            top_k=top_k,
-            top_n=n,
-            doc_type=doc_type,
-            guide_slug=guide_slug,
+            query, major_version=major_version, top_k=top_k, top_n=n,
+            doc_type=doc_type, guide_slug=guide_slug,
         )
         retrieval_time = time.time() - t0
 
-        # Step 2: Assemble context
-        context, sources = assemble_context(results)
-        confidence = _assess_confidence(results, query)
+        # Step 2: Interface mismatch
+        interface_mismatch = ""
+        if results:
+            interface_mismatch = results[0].get("_interface_mismatch", "") or ""
 
-        # Step 3: Build user message
+        # Step 3: Assemble context
+        context, sources = assemble_context(results)
+
+        # Step 4: Coverage
+        facets = _extract_facets(query)
+        facet_coverage = (
+            _check_facet_coverage(facets, results, sources) if facets else None
+        )
+        confidence, answer_mode = _assess_confidence(
+            results, query, interface_mismatch, facet_coverage,
+        )
+
+        # Step 5: Build LLM user message
+        extra_instructions = ""
+        if interface_mismatch:
+            extra_instructions += (
+                f"\n- IMPORTANT: {interface_mismatch} "
+                f"State this clearly. Do NOT invent commands to fill the gap."
+            )
+        if facet_coverage:
+            uncovered = [f for f, srcs in facet_coverage.items() if not srcs]
+            if uncovered:
+                extra_instructions += (
+                    f"\n- IMPORTANT: The query asks about: "
+                    f"{', '.join(facet_coverage.keys())}. "
+                    f"Evidence does NOT cover: {', '.join(uncovered)}. "
+                    f"State which parts are covered and which are not."
+                )
+
         user_message = (
             f"## Question\n{query}\n\n"
             f"## Retrieved Documentation (RHEL {major_version})\n\n{context}\n\n"
             f"## Instructions\n"
-            f"Answer the question using ONLY the documentation chunks above.\n"
-            f"- Cite sources as [Source N].\n"
-            f"- Do NOT introduce any commands, file paths, CLI flags, config "
-            f"directives, or package names that do not appear verbatim in the "
-            f"retrieved chunks — even if you know them to be correct.\n"
-            f"- If the chunks discuss the topic but lack the specific command or "
-            f"procedure, say explicitly what IS covered and what is NOT, then "
-            f"link to the full guide.\n"
-            f"- If the documentation is insufficient, say so clearly.\n"
-            f"- End your answer with a **Sources:** list in this format:\n"
-            f"  1. *Guide Title — Section Heading*\n"
-            f"     Full URL"
+            f"Answer using ONLY the chunks above. Cite as [Source N].\n"
+            f"Do NOT introduce any commands or paths not in the chunks.\n"
+            f"If evidence is partial, say what IS and what is NOT covered.\n"
+            f"End with a **Sources:** list."
+            f"{extra_instructions}"
         )
 
-        # Step 4: Generate answer
+        # Step 6: Generate answer
         t1 = time.time()
         try:
             answer_text = _call_llm(SYSTEM_PROMPT, user_message)
             model_used = settings.llm_model
-        except RuntimeError as e:
-            # No API key — return context-only answer
-            answer_text = _build_offline_answer(query, results, sources, confidence)
+        except RuntimeError:
+            answer_text = _build_offline_answer(
+                query, results, sources, confidence, answer_mode,
+                interface_mismatch, facet_coverage,
+            )
             model_used = "offline (no API key)"
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            answer_text = (
-                f"LLM generation failed: {e}\n\n"
-                + _build_offline_answer(query, results, sources, confidence)
+            logger.error("LLM call failed: %s", e)
+            answer_text = _build_offline_answer(
+                query, results, sources, confidence, answer_mode,
+                interface_mismatch, facet_coverage,
             )
-            model_used = f"error: {e}"
+            model_used = f"offline (LLM error: {e})"
         generation_time = time.time() - t1
 
-        return Answer(
+        answer = Answer(
             query=query,
             text=answer_text,
             sources=sources,
             confidence=confidence,
+            answer_mode=answer_mode,
             query_type=query_type,
+            interface_intent=interface_intent,
+            interface_mismatch=interface_mismatch,
             retrieval_time_s=round(retrieval_time, 3),
             generation_time_s=round(generation_time, 3),
             model=model_used,
             context_chunks=len(sources),
             raw_context=context,
         )
+
+        _log_query(answer)
+        return answer
 
     def retrieve_only(
         self,
@@ -417,15 +514,6 @@ class QAEngine:
         top_k: int = 20,
         top_n: int | None = None,
     ) -> tuple[list[dict], str, list[Source]]:
-        """
-        Retrieve and assemble context without calling the LLM.
-
-        Useful for debugging or when you want to inspect the context
-        before sending to an LLM.
-
-        Returns:
-            (results, context_string, sources)
-        """
         n = top_n or settings.search_rerank_top_n
         results = self.retriever.retrieve(
             query, major_version=major_version, top_k=top_k, top_n=n,
@@ -434,50 +522,138 @@ class QAEngine:
         return results, context, sources
 
 
+# ── Offline answer synthesis ──────────────────────────────────────────────────
+
 def _build_offline_answer(
     query: str,
     results: list[dict],
     sources: list[Source],
     confidence: str,
+    answer_mode: str,
+    interface_mismatch: str = "",
+    facet_coverage: dict[str, list[int]] | None = None,
 ) -> str:
     """
-    Build a structured answer when no LLM API is available.
+    Synthesize a concise, structured answer from retrieved chunks.
 
-    Shows the retrieved context in a readable format with consistent citations.
+    Instead of dumping raw chunk text, this:
+      1. Extracts a short summary sentence per chunk
+      2. Pulls out verbatim commands from fenced code blocks
+      3. Groups by facet for multi-part queries
+      4. Adds notes/limitations as needed
+      5. Cites every claim with [Source N]
     """
     if not results:
         return (
-            f"**Confidence: Insufficient**\n\n"
-            f"No relevant documentation found for: \"{query}\"\n"
+            "**Confidence: Insufficient**\n\n"
+            f"No relevant RHEL 9 documentation found for this query.\n"
             f"Please consult https://docs.redhat.com"
         )
 
-    lines = [
-        f"**Confidence: {confidence.title()}**\n",
-        f"*Retrieved {len(results)} relevant documentation chunks for RHEL 9.*\n",
-        (
-            "*(LLM generation unavailable — showing retrieved context directly.*\n"
-            "*Only verbatim content from the retrieved chunks is shown below."
-            " No commands or procedures have been added beyond what appears"
-            " in the source documents.)*\n"
-        ),
-    ]
+    lines: list[str] = []
 
-    for i, (r, s) in enumerate(zip(results, sources), start=1):
-        text = r.get("chunk_text", "")[:600]
-        lines.append(f"### [Source {i}] {s.heading}")
-        lines.append(f"*Guide: {s.guide_title}*\n")
-        lines.append(text)
-        lines.append(f"\n**Full section:** {s.section_url}\n")
+    # ── Mismatch warning ─────────────────────────────────────────────────
+    if interface_mismatch:
+        lines.append(f"> **Note:** {interface_mismatch}\n")
 
+    # ── Multi-facet: grouped answer ──────────────────────────────────────
+    if facet_coverage and any(facet_coverage.values()):
+        covered = [f for f, srcs in facet_coverage.items() if srcs]
+        uncovered = [f for f, srcs in facet_coverage.items() if not srcs]
+
+        shown_sources: set[int] = set()
+
+        for facet, source_indices in facet_coverage.items():
+            lines.append(f"## {facet.title()}\n")
+
+            if not source_indices:
+                lines.append(
+                    f"No specific **{facet}** instructions found in the "
+                    f"retrieved evidence. Consult the full guides linked below.\n"
+                )
+                continue
+
+            for idx in source_indices:
+                if idx in shown_sources:
+                    continue
+                shown_sources.add(idx)
+                i = idx - 1
+                if i >= len(results) or i >= len(sources):
+                    continue
+                _append_synthesized_chunk(lines, results[i], sources[i], idx)
+
+        # Remaining chunks under Notes
+        remaining = [
+            idx for idx in range(1, len(results) + 1)
+            if idx not in shown_sources
+        ]
+        if remaining:
+            lines.append("## Additional context\n")
+            for idx in remaining:
+                i = idx - 1
+                if i >= len(results) or i >= len(sources):
+                    continue
+                _append_synthesized_chunk(lines, results[i], sources[i], idx)
+
+    # ── Single-facet: sequential answer ──────────────────────────────────
+    else:
+        for i, (r, s) in enumerate(zip(results, sources), 1):
+            _append_synthesized_chunk(lines, r, s, i)
+
+    # ── Notes / limitations ──────────────────────────────────────────────
+    notes: list[str] = []
     if confidence in ("medium", "low", "insufficient"):
-        lines.append(
-            "---\n**Note:** The retrieved chunks may not contain the complete "
-            "procedure. For full details, consult the linked sections above or "
-            "the official Red Hat documentation at https://docs.redhat.com\n"
+        notes.append(
+            "The retrieved evidence may not contain the complete procedure. "
+            "Consult the linked sections or https://docs.redhat.com for full details."
         )
+    if facet_coverage:
+        uncovered = [f for f, srcs in facet_coverage.items() if not srcs]
+        if uncovered:
+            notes.append(
+                f"No evidence found for: **{', '.join(uncovered)}**. "
+                f"These operations may exist in sections not retrieved."
+            )
 
-    lines.append("---\n")
+    if notes:
+        lines.append("---\n**Notes:**\n")
+        for note in notes:
+            lines.append(f"- {note}")
+        lines.append("")
+
+    # ── Source list ───────────────────────────────────────────────────────
+    lines.append("---")
     lines.append(_format_source_list(sources))
 
     return "\n".join(lines)
+
+
+def _append_synthesized_chunk(
+    lines: list[str],
+    result: dict,
+    source: Source,
+    source_num: int,
+) -> None:
+    """Append a concise synthesis of one chunk: summary + commands + citation."""
+    text = result.get("chunk_text", "")
+    iface = result.get("_interface", "")
+    iface_tag = f" `[{iface}]`" if iface and iface != "neutral" else ""
+
+    # Summary line
+    summary = _first_sentence(text)
+    if summary:
+        lines.append(f"**{source.heading}**{iface_tag} [Source {source_num}]\n")
+        lines.append(f"{summary}\n")
+    else:
+        lines.append(f"**{source.heading}**{iface_tag} [Source {source_num}]\n")
+
+    # Commands — only fenced code blocks, verbatim
+    commands = _extract_commands(text)
+    if commands:
+        for cmd in commands[:3]:  # max 3 code blocks per chunk
+            lines.append(f"```\n{cmd}\n```\n")
+
+    # Link
+    lines.append(
+        f"*Full section:* [{source.guide_title}]({source.section_url})\n"
+    )

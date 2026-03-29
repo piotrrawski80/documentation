@@ -1,217 +1,179 @@
 """
-agent/app.py — Gradio web chat interface for the RHEL documentation agent.
+agent/app.py — Gradio web UI for the RHEL 9 documentation agent.
 
-This module starts a web server with a chat UI where users can type questions
-and get answers from the RHEL documentation agent.
+Uses QAEngine pipeline: hybrid retrieval -> cross-encoder reranking
+-> coverage assessment -> answer synthesis (offline or LLM).
 
-After starting, open http://localhost:7933 in your browser.
-
-The chat interface:
-- Shows conversation history (user messages + agent responses)
-- Streams agent responses token-by-token (no waiting for the full response)
-- Displays markdown formatting (headers, code blocks, links)
-- Persists conversation history within a session
+Works without an OpenRouter API key (offline mode).
 
 Usage:
-    # Start the web UI
-    python -m rh_linux_docs_agent.agent.app
-
-    # Or via the CLI
-    python scripts/start_agent.py
+    python scripts/start_web.py
 """
 
-import asyncio
 import logging
 
 import gradio as gr
 
-from rh_linux_docs_agent.agent.agent import get_agent
+from rh_linux_docs_agent.agent.qa import QAEngine, Answer
 from rh_linux_docs_agent.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ── Singleton QAEngine ───────────────────────────────────────────────────────
 
-async def chat(
-    message: str,
-    history: list[tuple[str, str]],
-) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Process a user message and return the agent's response.
+_engine: QAEngine | None = None
 
-    Called by Gradio on each user message. Runs the pydantic-ai agent
-    with the full conversation history for context.
 
-    Args:
-        message: The user's current message.
-        history: List of (user_message, agent_response) tuples from previous turns.
+def _get_engine() -> QAEngine:
+    global _engine
+    if _engine is None:
+        logger.info("Initializing QAEngine (first query will load models)...")
+        _engine = QAEngine(use_reranker=True)
+    return _engine
 
-    Returns:
-        Tuple of (empty string, updated history).
-        The empty string clears the input box after sending.
-        Updated history appends the new exchange.
-    """
+
+# ── Format answer for display ────────────────────────────────────────────────
+
+def _format_answer(answer: Answer) -> str:
+    """Build a single markdown string from an Answer for the chatbot."""
+    parts: list[str] = []
+
+    # Metadata bar
+    conf_emoji = {
+        "high": "\U0001f7e2", "medium": "\U0001f7e1",
+        "low": "\U0001f7e0", "insufficient": "\U0001f534",
+    }.get(answer.confidence, "\u26aa")
+
+    badges: list[str] = [
+        f"**Confidence: {answer.confidence.title()}**",
+        f"Type: *{answer.query_type}*",
+    ]
+    if answer.interface_intent != "neutral":
+        badges.append(f"Intent: *{answer.interface_intent.upper()}*")
+    if answer.answer_mode != "exact":
+        badges.append(f"Coverage: *{answer.answer_mode}*")
+    badges.append(f"Chunks: {answer.context_chunks}")
+    badges.append(f"Retrieval: {answer.retrieval_time_s}s")
+    if answer.generation_time_s > 0.01:
+        badges.append(f"Generation: {answer.generation_time_s}s")
+
+    badge_str = " \u00b7 ".join(badges)
+    parts.append(f"{conf_emoji} {badge_str}")
+    parts.append("")
+
+    # Interface mismatch warning
+    if answer.interface_mismatch:
+        parts.append(f"> **Note:** {answer.interface_mismatch}\n")
+
+    # Answer body
+    parts.append(answer.text)
+
+    # Source table (always appended for consistent clickable links)
+    if answer.sources:
+        parts.append("")
+        parts.append("---")
+        parts.append("**Cited sources:**\n")
+        for i, s in enumerate(answer.sources, 1):
+            score_str = f"{s.rerank_score:.1f}" if s.rerank_score else "\u2014"
+            parts.append(
+                f"{i}. **{s.guide_title}** \u2014 {s.heading} "
+                f"(score {score_str}, {s.content_type})  \n"
+                f"   {s.section_url}"
+            )
+
+    return "\n".join(parts)
+
+
+# ── Chat handler ─────────────────────────────────────────────────────────────
+
+def chat(message: str, history: list[dict]) -> tuple[str, list[dict]]:
+    """Process a user question through the QAEngine pipeline."""
     if not message.strip():
         return "", history
 
     try:
-        agent = get_agent()
-
-        # Build the message history for the agent.
-        # pydantic-ai accepts a list of message objects for multi-turn conversations.
-        # For simplicity, we include the conversation summary in the prompt.
-        context = ""
-        if history:
-            context = "Previous conversation:\n"
-            for user_msg, agent_msg in history[-3:]:  # Include last 3 turns
-                context += f"User: {user_msg}\nAssistant: {agent_msg}\n\n"
-            context += "Current question:\n"
-
-        full_query = f"{context}{message}" if context else message
-
-        # Run the agent — this calls the LLM and may trigger tool calls
-        result = await agent.run(full_query)
-        response = result.data
-
-        # Append to history
-        history = history + [(message, response)]
-
-    except ValueError as e:
-        # Configuration error (e.g., missing API key)
-        error_msg = (
-            f"**Configuration Error**: {e}\n\n"
-            "Please check your `.env` file has `OPENROUTER_API_KEY=your-key-here`."
-        )
-        history = history + [(message, error_msg)]
-
+        engine = _get_engine()
+        answer = engine.ask(message, major_version="9")
+        response = _format_answer(answer)
     except Exception as e:
-        logger.error(f"Agent error: {e}", exc_info=True)
-        error_msg = (
-            f"**Error**: {e}\n\n"
-            "If the database is empty, run: `python scripts/ingest.py --version 9 --limit 10`"
+        logger.error("QAEngine error: %s", e, exc_info=True)
+        response = (
+            f"**Error:** {e}\n\n"
+            "If the database is empty, run:\n"
+            "```\npython scripts/ingest.py --version 9\n```"
         )
-        history = history + [(message, error_msg)]
 
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": response},
+    ]
     return "", history
 
 
+# ── UI layout ────────────────────────────────────────────────────────────────
+
 def create_ui() -> gr.Blocks:
-    """
-    Create the Gradio web UI for the RHEL documentation agent.
+    with gr.Blocks() as demo:
 
-    Returns a Gradio Blocks interface with:
-    - Chat history display
-    - Message input box
-    - Send button + Enter key support
-    - Clear button to reset the conversation
-    - Example questions to get users started
-
-    Returns:
-        Configured Gradio Blocks interface.
-    """
-    with gr.Blocks(
-        title="RHEL Documentation Agent",
-        theme=gr.themes.Soft(),
-        css="""
-            .gradio-container { max-width: 900px; margin: auto; }
-            footer { display: none !important; }
-        """,
-    ) as demo:
-
-        # Header
         gr.Markdown(
-            """
-            # RHEL Documentation Agent
-            Ask questions about Red Hat Enterprise Linux documentation.
-            The agent searches RHEL 8, 9, and 10 docs and cites its sources.
-            """
+            "# RHEL 9 Documentation Agent\n"
+            "Ask questions about Red Hat Enterprise Linux 9. "
+            "Answers are grounded strictly in retrieved documentation with citations."
         )
 
-        # Chat display
-        chatbot = gr.Chatbot(
-            label="Conversation",
-            height=500,
-            show_copy_button=True,
-            render_markdown=True,
-            bubble_full_width=False,
-        )
+        chatbot = gr.Chatbot(label="Conversation", height=520)
 
-        # Input area
         with gr.Row():
             msg_input = gr.Textbox(
-                label="Your question",
                 placeholder="e.g., How do I configure a static IP address on RHEL 9?",
-                lines=2,
-                scale=4,
-                container=False,
+                lines=2, scale=4, container=False, show_label=False,
             )
             send_btn = gr.Button("Send", variant="primary", scale=1)
 
-        # Action buttons
         with gr.Row():
-            clear_btn = gr.Button("Clear conversation", variant="secondary")
+            clear_btn = gr.Button("Clear conversation", variant="secondary", size="sm")
 
-        # Example questions
         gr.Examples(
             examples=[
                 "How do I configure a static IP address on RHEL 9?",
-                "What are the differences in firewalld between RHEL 8 and 9?",
-                "How do I enable FIPS mode on RHEL 9?",
                 "How do I troubleshoot SELinux permission denials?",
-                "What replaced VDO in RHEL 9?",
-                "How do I migrate from iptables to nftables?",
-                "How do I configure NetworkManager with nmcli?",
-                "What is the difference between yum and dnf?",
+                "How to enable FIPS crypto policy on RHEL 9?",
+                "Create and extend LVM logical volumes from the command line",
+                "How to configure firewalld to allow SSH and HTTPS?",
+                "How to run a rootless Podman container as a systemd service?",
             ],
             inputs=msg_input,
             label="Example questions",
         )
 
-        # Wire up events
-        # Send on button click
-        send_btn.click(
-            fn=chat,
-            inputs=[msg_input, chatbot],
-            outputs=[msg_input, chatbot],
-        )
-
-        # Send on Enter key (Shift+Enter for newline)
-        msg_input.submit(
-            fn=chat,
-            inputs=[msg_input, chatbot],
-            outputs=[msg_input, chatbot],
-        )
-
-        # Clear conversation
-        clear_btn.click(
-            fn=lambda: ([], ""),
-            outputs=[chatbot, msg_input],
-        )
+        send_btn.click(fn=chat, inputs=[msg_input, chatbot], outputs=[msg_input, chatbot])
+        msg_input.submit(fn=chat, inputs=[msg_input, chatbot], outputs=[msg_input, chatbot])
+        clear_btn.click(fn=lambda: ([], ""), outputs=[chatbot, msg_input])
 
     return demo
 
 
-def main() -> None:
-    """
-    Start the Gradio web UI.
+# ── Entrypoint ───────────────────────────────────────────────────────────────
 
-    This is the entry point when running:
-        python -m rh_linux_docs_agent.agent.app
-    """
-    # Set up logging so we can see what's happening
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
-    logger.info(f"Starting RHEL Documentation Agent web UI on port {settings.web_port}")
-    logger.info(f"Open http://localhost:{settings.web_port} in your browser")
+    logger.info("Starting RHEL 9 Documentation Agent on port %d", settings.web_port)
+    logger.info("Open http://localhost:%d in your browser", settings.web_port)
 
     demo = create_ui()
     demo.launch(
         server_port=settings.web_port,
-        server_name="0.0.0.0",  # Accept connections from any network interface
-        share=False,             # Don't create a public Gradio link
-        show_error=True,         # Show errors in the UI
+        server_name="0.0.0.0",
+        share=False,
+        show_error=True,
+        theme=gr.themes.Soft(),
+        css="""
+            .gradio-container { max-width: 960px; margin: auto; }
+            footer { display: none !important; }
+        """,
     )
 
 
